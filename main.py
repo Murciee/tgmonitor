@@ -22,7 +22,7 @@ CONFIG_FILE = 'config.json'
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         default_config = {
-            "status": "running", # 新增全局状态
+            "status": "running",
             "groups": [],
             "keywords": [r"(?i)emby.*(注册|邀请|开注)"],
             "blacklist": []
@@ -47,7 +47,6 @@ WAITING_STATE = {}
 #         第一部分：Bot 交互界面与逻辑
 # ==========================================
 
-# --- UI 渲染函数 ---
 def build_main_menu(config):
     status_icon = "🟢 运行中" if config['status'] == 'running' else "🔴 已暂停"
     text = f"⚙️ **Emby 监控管理控制台**\n\n当前状态: **{status_icon}**\n请选择要管理的模块："
@@ -90,13 +89,11 @@ def build_delete_list(config, list_type, page=0):
     page_items = data_list[start_idx:end_idx]
 
     buttons = []
-    # 使用索引来删除，避免正则字符串过长导致 callback data 超限
     for i, item in enumerate(page_items):
         actual_idx = start_idx + i
         display_text = f"❌ {str(item)[:30]}..." if len(str(item)) > 30 else f"❌ {item}"
         buttons.append([Button.inline(display_text, f"del_{list_type}_{actual_idx}".encode())])
     
-    # 分页按钮
     nav_buttons = []
     if page > 0:
         nav_buttons.append(Button.inline("⬅️ 上一页", f"list_{list_type}_{page-1}".encode()))
@@ -109,7 +106,6 @@ def build_delete_list(config, list_type, page=0):
     return f"{title}\n(第 {page+1}/{total_pages} 页)", buttons
 
 
-# --- 消息监听器 ---
 @bot_client.on(events.NewMessage(from_users=ADMIN_ID))
 async def bot_message_handler(event):
     if event.text.startswith('/start'):
@@ -138,7 +134,6 @@ async def bot_message_handler(event):
             await event.reply(text, buttons=buttons)
             return
 
-    # 处理手动打字输入
     state = WAITING_STATE.get(ADMIN_ID)
     if not state: return
     if event.text.startswith('/'): return
@@ -170,7 +165,7 @@ async def bot_message_handler(event):
     except ValueError:
         await event.reply("❌ ID必须是数字，请重新输入或发 /cancel 取消。")
 
-# --- 回调按钮监听器 ---
+
 @bot_client.on(events.CallbackQuery())
 async def bot_callback(event):
     if event.sender_id != ADMIN_ID:
@@ -179,9 +174,8 @@ async def bot_callback(event):
 
     data = event.data.decode('utf-8')
     config = load_config()
-    WAITING_STATE[ADMIN_ID] = None # 点击按钮清空输入状态
+    WAITING_STATE[ADMIN_ID] = None
 
-    # 主菜单与模块切换
     if data == 'menu_main':
         t, b = build_main_menu(config)
         await event.edit(t, buttons=b)
@@ -189,14 +183,12 @@ async def bot_callback(event):
         t, b = build_sub_menu(data.split('_')[1])
         await event.edit(t, buttons=b)
     
-    # 状态切换
     elif data == 'toggle_status':
         config['status'] = 'paused' if config['status'] == 'running' else 'running'
         save_config(config)
         t, b = build_main_menu(config)
         await event.edit(t, buttons=b)
         
-    # 查看全部配置
     elif data == 'view_all':
         text = (
             f"📊 **完整配置概览**\n\n"
@@ -208,14 +200,12 @@ async def bot_callback(event):
         await event.answer("已在聊天中输出全部配置")
         await event.reply(text)
 
-    # 提示手动输入
     elif data.startswith('prompt_add_'):
         m_type = data.split('_')[2]
         WAITING_STATE[ADMIN_ID] = f'add_{m_type}'
         tips = {'grp': '群组ID', 'key': '关键词/正则', 'blk': '用户ID'}
         await event.reply(f"👉 请发送要添加的 **{tips[m_type]}**\n_发送 /cancel 取消_")
 
-    # 快捷提取添加 (Quick Actions)
     elif data.startswith('quick_'):
         parts = data.split('_')
         action, val = parts[1], int(parts[2])
@@ -224,14 +214,12 @@ async def bot_callback(event):
         save_config(config)
         await event.edit(f"✅ 已成功执行快捷操作！")
 
-    # 进入删除列表分页
     elif data.startswith('list_'):
         parts = data.split('_')
         list_type, page = parts[1], int(parts[2])
         t, b = build_delete_list(config, list_type, page)
         await event.edit(t, buttons=b)
 
-    # 执行列表删除操作 (按索引)
     elif data.startswith('del_'):
         parts = data.split('_')
         list_type, idx = parts[1], int(parts[2])
@@ -242,7 +230,6 @@ async def bot_callback(event):
             save_config(config)
             await event.answer(f"已删除: {deleted_item}")
         
-        # 删完刷新当前页
         t, b = build_delete_list(config, list_type, 0)
         await event.edit(t, buttons=b)
 
@@ -255,14 +242,11 @@ async def bot_callback(event):
 async def user_handler(event):
     config = load_config()
     
-    # 1. 全局状态检查
     if config.get('status', 'running') != 'running': return
     
-    # 2. 群组检查
     chat_id = event.chat_id
     if chat_id not in config['groups']: return
 
-    # 3. 黑名单检查
     sender_id = event.sender_id
     fwd_from_id = None
     if event.fwd_from:
@@ -275,7 +259,6 @@ async def user_handler(event):
 
     if is_blocked(sender_id) or is_blocked(fwd_from_id): return
 
-    # 4. 正则匹配
     text = event.message.text or ""
     matched = False
     for regex in config['keywords']:
@@ -292,17 +275,29 @@ async def user_handler(event):
         
         sender_name = "Unknown"
         if sender:
-            if hasattr(sender, 'first_name'): sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
-            elif hasattr(sender, 'title'): sender_name = sender.title
+            if hasattr(sender, 'first_name'): 
+                first = getattr(sender, 'first_name', None) or ''
+                last = getattr(sender, 'last_name', None) or ''
+                sender_name = f"{first} {last}".strip()
+            elif hasattr(sender, 'title'): 
+                sender_name = sender.title
 
+        # --- 修复 None 问题的核心逻辑 ---
         fwd_name = "无"
         if event.fwd_from:
-            if event.fwd_from.from_name: fwd_name = event.fwd_from.from_name
+            if event.fwd_from.from_name: 
+                fwd_name = event.fwd_from.from_name
             elif event.fwd_from.from_id:
                 try:
                     fwd_entity = await user_client.get_entity(event.fwd_from.from_id)
-                    fwd_name = getattr(fwd_entity, 'title', f"{getattr(fwd_entity, 'first_name', '')} {getattr(fwd_entity, 'last_name', '')}".strip())
-                except: fwd_name = f"ID: {fwd_from_id}"
+                    if hasattr(fwd_entity, 'title') and fwd_entity.title:
+                        fwd_name = fwd_entity.title
+                    else:
+                        first = getattr(fwd_entity, 'first_name', None) or ''
+                        last = getattr(fwd_entity, 'last_name', None) or ''
+                        fwd_name = f"{first} {last}".strip()
+                except: 
+                    fwd_name = f"ID: {fwd_from_id}"
 
         source_name = getattr(chat, 'title', "Unknown Group")
         chat_id_str = str(chat_id)
