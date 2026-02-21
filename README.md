@@ -1,3 +1,4 @@
+Markdown
 # Telegram Emby Monitor (Userbot + Bot 双端交互系统)
 
 这是一个专为 Telegram 打造的高级群组关键字监控系统。它通过 Userbot 隐形监听指定群组，当触发设定好的正则/关键词时，自动将消息**原生转发**到你的私人频道。
@@ -39,7 +40,7 @@
 * **TARGET_CHANNEL**: 接收通知的频道 ID（如 `-100123456789`）。
 * **ADMIN_ID**: 你个人的 Telegram 用户 ID（用于鉴权）。
 
-### 2. 填写 Docker Compose
+### 2. 编写配置
 修改 `docker-compose.yml` 环境变量部分：
 
 ```yaml
@@ -58,3 +59,27 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./:/app
+3. 首次启动与登录 (❗ 重要)
+由于 Userbot 首次登录需要输入官方验证码，必须进行一次交互式操作：
+
+前台运行：
+
+Bash
+docker-compose run --rm -it emby-monitor
+完成登录： 按照终端提示输入手机号（带区号，如 +86138...），随后填入 Telegram 官方发来的验证码。
+
+退出交互： 当看到 🎉 系统运行中... 提示后，按 Ctrl+C 退出。此时当前目录已生成免密登录凭证 user_session.session。
+
+4. 正式后台运行
+凭证生成后，直接拉起后台服务：
+
+Bash
+docker-compose up -d
+🎮 使用方法
+管理控制台：在 Telegram 中向你的官方 Bot 发送 /start 即可唤出控制面板。
+
+快捷添加：在任何群组看到想要监控的群或想要拉黑的用户，直接转发该消息给你的 Bot，根据提示点击按钮即可。
+
+黑名单保护：系统会自动检测“转发者”和“原作者”，只要其中一人在黑名单，该消息就会被拦截。
+
+⚠️ 安全警告：本系统已做严格的 ID 隔离。仅限环境变量中设置的 ADMIN_ID 用户有权点击按钮。其他人发送 /start 或点击按钮将不会得到任何响应或被拦截。
