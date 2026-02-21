@@ -58,7 +58,7 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./:/app
-
+```
 3. 首次启动与登录 (❗ 重要)
 由于 Userbot 首次登录需要输入官方验证码，必须进行一次交互式操作：
 
