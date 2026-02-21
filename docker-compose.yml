@@ -3,7 +3,7 @@ version: '3.8'
 services:
   emby-monitor:
     build: .
-    container_name: emby_monitor
+    container_name: tg_monitor
     restart: unless-stopped
     environment:
       - API_ID=你的API_ID
