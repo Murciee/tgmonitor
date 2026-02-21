@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  emby-monitor:
+    build: .
+    container_name: emby_monitor
+    restart: unless-stopped
+    environment:
+      - API_ID=你的API_ID
+      - API_HASH=你的API_HASH
+      - BOT_TOKEN=你的Bot_Token          # 从 @BotFather 获取
+      - TARGET_CHANNEL=-100xxxxxxxxxx    # 接收通知的频道ID
+      - ADMIN_ID=123456789               # 你的个人TG账号ID
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/app                          # 挂载整个目录以保存 session 和 config.json
