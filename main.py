@@ -3,7 +3,8 @@ import json
 import re
 import logging
 import asyncio
-from telethon import TelegramClient, events, Button
+import math
+from telethon import TelegramClient, events, Button, utils
 from telethon.tl.types import User
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
@@ -11,9 +12,9 @@ logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s'
 # --- 环境变量配置 ---
 API_ID = int(os.environ.get('API_ID'))
 API_HASH = os.environ.get('API_HASH')
-BOT_TOKEN = os.environ.get('BOT_TOKEN')        # 你从 BotFather 申请的 Token
-TARGET_CHANNEL = int(os.environ.get('TARGET_CHANNEL')) 
-ADMIN_ID = int(os.environ.get('ADMIN_ID'))     # 你的个人TG ID (仅允许你操作Bot)
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+TARGET_CHANNEL = int(os.environ.get('TARGET_CHANNEL'))
+ADMIN_ID = int(os.environ.get('ADMIN_ID'))
 
 CONFIG_FILE = 'config.json'
 
@@ -21,6 +22,7 @@ CONFIG_FILE = 'config.json'
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         default_config = {
+            "status": "running", # 新增全局状态
             "groups": [],
             "keywords": [r"(?i)emby.*(注册|邀请|开注)"],
             "blacklist": []
@@ -28,120 +30,221 @@ def load_config():
         save_config(default_config)
         return default_config
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        config = json.load(f)
+        if "status" not in config: config["status"] = "running"
+        return config
 
 def save_config(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
-# --- 初始化双客户端 ---
-# user_client 用于监听群组消息
 user_client = TelegramClient('user_session', API_ID, API_HASH)
-# bot_client 用于提供交互界面
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
-# 用于记录 Bot 交互状态 (等待用户输入什么)
 WAITING_STATE = {}
 
 # ==========================================
-#         第一部分：Bot 管理端逻辑 (交互UI)
+#         第一部分：Bot 交互界面与逻辑
 # ==========================================
 
-async def send_main_menu(chat_id):
-    """发送主菜单面板"""
+# --- UI 渲染函数 ---
+def build_main_menu(config):
+    status_icon = "🟢 运行中" if config['status'] == 'running' else "🔴 已暂停"
+    text = f"⚙️ **Emby 监控管理控制台**\n\n当前状态: **{status_icon}**\n请选择要管理的模块："
     buttons = [
-        [Button.inline("➕ 添加监控群", b"add_group"), Button.inline("➖ 移除监控群", b"del_group")],
-        [Button.inline("➕ 添加正则词", b"add_keyword"), Button.inline("➖ 移除正则词", b"del_keyword")],
-        [Button.inline("➕ 拉黑用户", b"add_black"), Button.inline("➖ 移出黑名单", b"del_black")],
-        [Button.inline("📊 查看当前所有配置", b"view_config")]
+        [Button.inline(f"切换状态：{status_icon}", b"toggle_status")],
+        [Button.inline(f"📁 群组管理 ({len(config['groups'])})", b"menu_grp"),
+         Button.inline(f"🏷️ 关键词管理 ({len(config['keywords'])})", b"menu_key")],
+        [Button.inline(f"🚫 黑名单管理 ({len(config['blacklist'])})", b"menu_blk"),
+         Button.inline("📊 查看完整配置", b"view_all")]
     ]
-    await bot_client.send_message(chat_id, "⚙️ **Emby 监控管理面板**\n请选择你要进行的操作：", buttons=buttons)
+    return text, buttons
 
-@bot_client.on(events.NewMessage(from_users=ADMIN_ID, pattern='/start'))
-async def bot_start(event):
-    WAITING_STATE[ADMIN_ID] = None
-    await send_main_menu(event.chat_id)
+def build_sub_menu(menu_type):
+    titles = {'grp': '📁 **群组管理**', 'key': '🏷️ **关键词/正则管理**', 'blk': '🚫 **黑名单管理**'}
+    text = f"{titles[menu_type]}\n请选择操作："
+    buttons = [
+        [Button.inline("➕ 添加新项", f"prompt_add_{menu_type}".encode()), 
+         Button.inline("➖ 点击列表删除", f"list_{menu_type}_0".encode())],
+        [Button.inline("🔙 返回主菜单", b"menu_main")]
+    ]
+    return text, buttons
 
-@bot_client.on(events.CallbackQuery(from_users=ADMIN_ID))
-async def bot_callback(event):
-    """处理按钮点击事件"""
-    data = event.data.decode('utf-8')
+def build_delete_list(config, list_type, page=0):
+    items_per_page = 8
+    if list_type == 'grp':
+        data_list = config['groups']
+        title = "📁 点击群组 ID 删除："
+    elif list_type == 'key':
+        data_list = config['keywords']
+        title = "🏷️ 点击关键词/正则删除："
+    else:
+        data_list = config['blacklist']
+        title = "🚫 点击黑名单 ID 删除："
+
+    total_pages = math.ceil(len(data_list) / items_per_page) or 1
+    page = min(max(0, page), total_pages - 1)
     
-    if data == 'view_config':
+    start_idx = page * items_per_page
+    end_idx = start_idx + items_per_page
+    page_items = data_list[start_idx:end_idx]
+
+    buttons = []
+    # 使用索引来删除，避免正则字符串过长导致 callback data 超限
+    for i, item in enumerate(page_items):
+        actual_idx = start_idx + i
+        display_text = f"❌ {str(item)[:30]}..." if len(str(item)) > 30 else f"❌ {item}"
+        buttons.append([Button.inline(display_text, f"del_{list_type}_{actual_idx}".encode())])
+    
+    # 分页按钮
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(Button.inline("⬅️ 上一页", f"list_{list_type}_{page-1}".encode()))
+    if page < total_pages - 1:
+        nav_buttons.append(Button.inline("下一页 ➡️", f"list_{list_type}_{page+1}".encode()))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+        
+    buttons.append([Button.inline("🔙 返回上一级", f"menu_{list_type}".encode())])
+    return f"{title}\n(第 {page+1}/{total_pages} 页)", buttons
+
+
+# --- 消息监听器 ---
+@bot_client.on(events.NewMessage(from_users=ADMIN_ID))
+async def bot_message_handler(event):
+    if event.text.startswith('/start'):
+        WAITING_STATE[ADMIN_ID] = None
         config = load_config()
-        text = (
-            f"📊 **当前运行配置**\n\n"
-            f"**监控群组 ({len(config['groups'])}):**\n`{config['groups']}`\n\n"
-            f"**匹配正则 ({len(config['keywords'])}):**\n`{config['keywords']}`\n\n"
-            f"**黑名单UID ({len(config['blacklist'])}):**\n`{config['blacklist']}`"
-        )
-        await event.reply(text)
+        text, buttons = build_main_menu(config)
+        await event.reply(text, buttons=buttons)
         return
 
-    # 记录用户的下一步输入意图
-    WAITING_STATE[ADMIN_ID] = data
-    
-    prompts = {
-        'add_group': "👉 请发送要**添加**的群组ID（例如: -10012345678）\n_提示: 可发送 /cancel 取消_",
-        'del_group': "👉 请发送要**移除**的群组ID\n_提示: 可发送 /cancel 取消_",
-        'add_keyword': "👉 请发送要**添加**的正则或关键词（例如: `(?i)emby`）\n_提示: 可发送 /cancel 取消_",
-        'del_keyword': "👉 请发送要**移除**的正则或关键词\n_提示: 可发送 /cancel 取消_",
-        'add_black': "👉 请发送要**拉黑**的用户ID\n_提示: 可发送 /cancel 取消_",
-        'del_black': "👉 请发送要**解封**的用户ID\n_提示: 可发送 /cancel 取消_"
-    }
-    
-    if data in prompts:
-        await event.reply(prompts[data])
+    # 快捷功能：抓取转发消息提取 ID
+    if event.fwd_from:
+        WAITING_STATE[ADMIN_ID] = None
+        chat_id, user_id = None, None
+        
+        if event.fwd_from.saved_from_peer:
+            chat_id = utils.get_peer_id(event.fwd_from.saved_from_peer)
+        if event.fwd_from.from_id:
+            user_id = utils.get_peer_id(event.fwd_from.from_id)
+            
+        if chat_id or user_id:
+            text = "🤖 **解析转发消息成功**\n请选择快捷操作："
+            buttons = []
+            if chat_id: buttons.append([Button.inline(f"➕ 将群组 {chat_id} 加入监控", f"quick_grp_{chat_id}".encode())])
+            if user_id: buttons.append([Button.inline(f"🚫 将用户 {user_id} 加入黑名单", f"quick_blk_{user_id}".encode())])
+            buttons.append([Button.inline("❌ 取消", b"menu_main")])
+            await event.reply(text, buttons=buttons)
+            return
 
-@bot_client.on(events.NewMessage(from_users=ADMIN_ID))
-async def bot_text_input(event):
-    """处理用户根据提示输入的文本"""
-    if event.text.startswith('/'): return # 忽略命令
-    
+    # 处理手动打字输入
     state = WAITING_STATE.get(ADMIN_ID)
-    if not state: return # 如果不在等待输入状态，则不理会
-
+    if not state: return
+    if event.text.startswith('/'): return
+    
     text = event.text.strip()
     if text.lower() == '/cancel':
         WAITING_STATE[ADMIN_ID] = None
-        await event.reply("✅ 操作已取消。")
-        await send_main_menu(event.chat_id)
+        cfg = load_config()
+        t, b = build_main_menu(cfg)
+        await event.reply("✅ 操作已取消。", buttons=b)
         return
 
     config = load_config()
-    success_msg = ""
-
     try:
-        if state in ['add_group', 'del_group', 'add_black', 'del_black']:
-            val = int(text) # 尝试转为数字
-            if state == 'add_group':
-                if val not in config['groups']: config['groups'].append(val)
-                success_msg = f"✅ 成功添加监控群组: {val}"
-            elif state == 'del_group':
-                if val in config['groups']: config['groups'].remove(val)
-                success_msg = f"✅ 成功移除监控群组: {val}"
-            elif state == 'add_black':
-                if val not in config['blacklist']: config['blacklist'].append(val)
-                success_msg = f"✅ 成功拉黑用户: {val}"
-            elif state == 'del_black':
-                if val in config['blacklist']: config['blacklist'].remove(val)
-                success_msg = f"✅ 成功移出黑名单: {val}"
-                
-        elif state == 'add_keyword':
+        if state == 'add_grp':
+            val = int(text)
+            if val not in config['groups']: config['groups'].append(val)
+        elif state == 'add_blk':
+            val = int(text)
+            if val not in config['blacklist']: config['blacklist'].append(val)
+        elif state == 'add_key':
             if text not in config['keywords']: config['keywords'].append(text)
-            success_msg = f"✅ 成功添加关键词/正则: `{text}`"
             
-        elif state == 'del_keyword':
-            if text in config['keywords']: config['keywords'].remove(text)
-            success_msg = f"✅ 成功移除关键词/正则: `{text}`"
-
         save_config(config)
-        WAITING_STATE[ADMIN_ID] = None # 重置状态
-        await event.reply(success_msg)
-        await send_main_menu(event.chat_id)
-
+        WAITING_STATE[ADMIN_ID] = None
+        cfg = load_config()
+        t, b = build_main_menu(cfg)
+        await event.reply(f"✅ 添加成功：{text}", buttons=b)
     except ValueError:
-        await event.reply("❌ 输入格式错误！群组ID和用户ID必须是数字，请重新输入或发送 /cancel 取消。")
+        await event.reply("❌ ID必须是数字，请重新输入或发 /cancel 取消。")
+
+# --- 回调按钮监听器 ---
+@bot_client.on(events.CallbackQuery())
+async def bot_callback(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("❌ 无权限", alert=True)
+        return
+
+    data = event.data.decode('utf-8')
+    config = load_config()
+    WAITING_STATE[ADMIN_ID] = None # 点击按钮清空输入状态
+
+    # 主菜单与模块切换
+    if data == 'menu_main':
+        t, b = build_main_menu(config)
+        await event.edit(t, buttons=b)
+    elif data in ['menu_grp', 'menu_key', 'menu_blk']:
+        t, b = build_sub_menu(data.split('_')[1])
+        await event.edit(t, buttons=b)
+    
+    # 状态切换
+    elif data == 'toggle_status':
+        config['status'] = 'paused' if config['status'] == 'running' else 'running'
+        save_config(config)
+        t, b = build_main_menu(config)
+        await event.edit(t, buttons=b)
+        
+    # 查看全部配置
+    elif data == 'view_all':
+        text = (
+            f"📊 **完整配置概览**\n\n"
+            f"**状态:** {config['status']}\n"
+            f"**群组:** `{config['groups']}`\n"
+            f"**正则:** `{config['keywords']}`\n"
+            f"**黑名单:** `{config['blacklist']}`"
+        )
+        await event.answer("已在聊天中输出全部配置")
+        await event.reply(text)
+
+    # 提示手动输入
+    elif data.startswith('prompt_add_'):
+        m_type = data.split('_')[2]
+        WAITING_STATE[ADMIN_ID] = f'add_{m_type}'
+        tips = {'grp': '群组ID', 'key': '关键词/正则', 'blk': '用户ID'}
+        await event.reply(f"👉 请发送要添加的 **{tips[m_type]}**\n_发送 /cancel 取消_")
+
+    # 快捷提取添加 (Quick Actions)
+    elif data.startswith('quick_'):
+        parts = data.split('_')
+        action, val = parts[1], int(parts[2])
+        if action == 'grp' and val not in config['groups']: config['groups'].append(val)
+        if action == 'blk' and val not in config['blacklist']: config['blacklist'].append(val)
+        save_config(config)
+        await event.edit(f"✅ 已成功执行快捷操作！")
+
+    # 进入删除列表分页
+    elif data.startswith('list_'):
+        parts = data.split('_')
+        list_type, page = parts[1], int(parts[2])
+        t, b = build_delete_list(config, list_type, page)
+        await event.edit(t, buttons=b)
+
+    # 执行列表删除操作 (按索引)
+    elif data.startswith('del_'):
+        parts = data.split('_')
+        list_type, idx = parts[1], int(parts[2])
+        target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
+        
+        if 0 <= idx < len(target_list):
+            deleted_item = target_list.pop(idx)
+            save_config(config)
+            await event.answer(f"已删除: {deleted_item}")
+        
+        # 删完刷新当前页
+        t, b = build_delete_list(config, list_type, 0)
+        await event.edit(t, buttons=b)
 
 
 # ==========================================
@@ -150,24 +253,30 @@ async def bot_text_input(event):
 
 @user_client.on(events.NewMessage)
 async def user_handler(event):
-    # 动态加载最新配置
     config = load_config()
     
-    # 1. 检查是否在监控群组中
+    # 1. 全局状态检查
+    if config.get('status', 'running') != 'running': return
+    
+    # 2. 群组检查
     chat_id = event.chat_id
-    if chat_id not in config['groups']:
-        return
+    if chat_id not in config['groups']: return
 
-    sender = await event.get_sender()
-    chat = await event.get_chat()
-    
-    # 2. 检查黑名单
-    if sender and sender.id in config['blacklist']:
-        return
+    # 3. 黑名单检查
+    sender_id = event.sender_id
+    fwd_from_id = None
+    if event.fwd_from:
+        if event.fwd_from.from_id:
+            if hasattr(event.fwd_from.from_id, 'user_id'): fwd_from_id = event.fwd_from.from_id.user_id
+            elif hasattr(event.fwd_from.from_id, 'channel_id'): fwd_from_id = event.fwd_from.from_id.channel_id
 
+    blacklist_strs = [str(x).replace('-100', '') for x in config['blacklist']]
+    def is_blocked(uid): return str(uid).replace('-100', '') in blacklist_strs if uid else False
+
+    if is_blocked(sender_id) or is_blocked(fwd_from_id): return
+
+    # 4. 正则匹配
     text = event.message.text or ""
-    
-    # 3. 正则匹配
     matched = False
     for regex in config['keywords']:
         try:
@@ -178,43 +287,53 @@ async def user_handler(event):
             logging.error(f"正则错误 {regex}: {e}")
             
     if matched:
-        # 4. 格式化并转发
-        source_name = chat.title if hasattr(chat, 'title') else "Unknown Group"
+        chat = await event.get_chat()
+        sender = await event.get_sender()
+        
         sender_name = "Unknown"
-        if sender and isinstance(sender, User):
-            sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+        if sender:
+            if hasattr(sender, 'first_name'): sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+            elif hasattr(sender, 'title'): sender_name = sender.title
+
+        fwd_name = "无"
+        if event.fwd_from:
+            if event.fwd_from.from_name: fwd_name = event.fwd_from.from_name
+            elif event.fwd_from.from_id:
+                try:
+                    fwd_entity = await user_client.get_entity(event.fwd_from.from_id)
+                    fwd_name = getattr(fwd_entity, 'title', f"{getattr(fwd_entity, 'first_name', '')} {getattr(fwd_entity, 'last_name', '')}".strip())
+                except: fwd_name = f"ID: {fwd_from_id}"
+
+        source_name = getattr(chat, 'title', "Unknown Group")
+        chat_id_str = str(chat_id)
+        msg_link = f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None) else f"https://t.me/c/{chat_id_str.replace('-100', '')}/{event.id}"
         
         log_text = (
             f"**📢 监控命中**\n"
-            f"**来源群组:** {source_name} (`{chat_id}`)\n"
-            f"**发送用户:** {sender_name} (`{sender.id if sender else 'N/A'}`)\n"
-            f"**直达链接:** [点击跳转](https://t.me/c/{str(chat_id).replace('-100','')}/{event.message.id})\n"
-            f"---\n"
-            f"{text}"
+            f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
+            f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
+            f"**直接来源:** {fwd_name}\n"
+            f"**直达链接:** [点击跳转]({msg_link})\n"
+            f"--- 👇 原消息如下 👇 ---"
         )
         
         try:
             await user_client.send_message(TARGET_CHANNEL, log_text, link_preview=False)
-            logging.info(f"成功转发一条消息来自: {source_name}")
+            await event.forward_to(TARGET_CHANNEL)
+            logging.info(f"转发成功: {source_name}")
         except Exception as e:
             logging.error(f"转发失败: {e}")
 
 # --- 启动逻辑 ---
 async def main():
-    print("正在启动系统...")
-    # 启动 Userbot (如果没登录过会要求输入验证码)
-    await user_client.start()
-    print("✅ Userbot 启动成功！")
-    
-    # 启动 Bot
+    print("正在连接交互 Bot...")
     await bot_client.start(bot_token=BOT_TOKEN)
-    print("✅ 交互 Bot 启动成功！")
-    
-    print("🎉 系统运行中... 请前往你的 Bot 发送 /start 开始管理。")
-    await asyncio.gather(
-        user_client.run_until_disconnected(),
-        bot_client.run_until_disconnected()
-    )
+    print("✅ 交互 Bot 启动成功！\n🎉 系统运行中... 请前往你的 Bot 发送 /start 开始管理。")
+    await asyncio.gather(user_client.run_until_disconnected(), bot_client.run_until_disconnected())
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    print("--- 检查 Userbot 凭证 ---")
+    user_client.start()
+    print("✅ Userbot 检查通过！\n")
+    loop.run_until_complete(main())
