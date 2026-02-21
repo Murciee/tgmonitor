@@ -31,7 +31,8 @@ environment:
   - BOT_TOKEN=你的Bot_Token
   - TARGET_CHANNEL=-100xxxxxxxxxx
   - ADMIN_ID=123456789
-3. 首次交互登录 (关键)
+```
+### 3. 首次交互登录 (关键)
 由于 Telegram 的机制，Userbot 首次运行必须接收手机验证码。千万不要直接后台启动！
 
 在终端中运行交互模式：
@@ -44,7 +45,7 @@ docker-compose run --rm -it emby-monitor
 
 看到 系统运行中... 提示后，按 Ctrl+C 退出。此时当前目录已生成免密登录凭证 .session。
 
-4. 正式后台运行
+### 4. 正式后台运行
 凭证生成后，一键拉起后台服务：
 
 Bash
