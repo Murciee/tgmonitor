@@ -1,0 +1,22 @@
+---
+
+### 2. .gitignore (防止敏感信息泄露)
+
+```text
+# 敏感的 Session 文件，严禁上传！
+*.session
+*.session-journal
+
+# 个人配置文件（内含监控群ID、黑名单列表等）
+config.json
+
+# 环境变量文件
+.env
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Docker 缓存
+.dockerignore
