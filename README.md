@@ -1,5 +1,7 @@
 # Telegram Monitor (Userbot + Bot 双端交互系统)
 
+<img width="324" height="166" alt="image" src="https://github.com/user-attachments/assets/5c7464f6-8bcb-481e-bd78-04335012a01b" />
+
 这是一个专为 Telegram 打造的高级群组关键字监控系统。它通过 Userbot 隐形监听指定群组，当触发设定好的正则/关键词时，自动将消息**原生转发**到你的私人频道。
 
 集成官方 Bot 作为**可视化控制台**，你可以直接在手机上点击按钮管理所有规则，无需接触代码或重启服务。
