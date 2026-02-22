@@ -366,22 +366,24 @@ async def user_handler(event):
 
         needs_native_forward = has_buttons or has_real_media
 
-        log_header = (
-            f"**📢 监控命中**\n"
+        # 构建统一的来源信息块
+        source_info = (
             f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
             f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
             f"{fwd_info}"
-            f"**直达链接:** [点击跳转]({msg_link})\n"
-            f"--- 👇 原消息如下 👇 ---"
+            f"**直达链接:** [点击跳转]({msg_link})"
         )
         
         try:
             if needs_native_forward:
+                # 模式A：拆分发送。先发来源头，再发原生内容，确保外面预览到的是内容。
+                log_header = f"🎯 **来源信息**\n{source_info}"
                 await user_client.send_message(TARGET_CHANNEL, log_header, link_preview=False)
                 await event.forward_to(TARGET_CHANNEL)
                 logging.info(f"分流发送 (带按钮/媒体): {source_name}")
             else:
-                final_text = f"{log_header}\n\n{text}"
+                # 模式B：合并发送。正文放顶端，下面加分隔线和来源信息。
+                final_text = f"{text}\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n{source_info}"
                 await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
                 logging.info(f"极速合并发送 (纯文本): {source_name}")
                 
