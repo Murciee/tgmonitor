@@ -1,4 +1,4 @@
-# Telegram Emby Monitor (Userbot + Bot 双端交互系统)
+# Telegram Monitor (Userbot + Bot 双端交互系统)
 
 这是一个专为 Telegram 打造的高级群组关键字监控系统。它通过 Userbot 隐形监听指定群组，当触发设定好的正则/关键词时，自动将消息**原生转发**到你的私人频道。
 
