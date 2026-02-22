@@ -46,7 +46,7 @@
     services:
       emby-monitor:
         build: .
-        container_name: emby_monitor
+        container_name: tg_monitor
         restart: unless-stopped
         environment:
           - API_ID=12345
@@ -63,7 +63,7 @@
 
 执行登录命令：
 
-    docker-compose run --rm -it emby-monitor
+    docker-compose run --rm -it tg-monitor
 
 登录步骤说明：
 1. 按照终端提示输入手机号（需带国家区号，如 `+86138...`）。
