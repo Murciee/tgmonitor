@@ -64,22 +64,25 @@ def build_sub_menu(menu_type):
     text = f"{titles[menu_type]}\n请选择操作："
     buttons = [
         [Button.inline("➕ 添加新项", f"prompt_add_{menu_type}".encode()), 
-         Button.inline("➖ 点击列表删除", f"list_{menu_type}_0".encode())],
+         Button.inline("➖ 点击删除", f"list_{menu_type}_del_0".encode())],
+        [Button.inline("📝 点击修改", f"list_{menu_type}_edit_0".encode())],
         [Button.inline("🔙 返回主菜单", b"menu_main")]
     ]
     return text, buttons
 
-def build_delete_list(config, list_type, page=0):
+def build_item_list(config, list_type, action, page=0):
     items_per_page = 8
+    
+    action_text = "删除" if action == 'del' else "修改"
     if list_type == 'grp':
         data_list = config['groups']
-        title = "📁 点击群组 ID 删除："
+        title = f"📁 点击群组 ID {action_text}："
     elif list_type == 'key':
         data_list = config['keywords']
-        title = "🏷️ 点击关键词/正则删除："
+        title = f"🏷️ 点击关键词/正则 {action_text}："
     else:
         data_list = config['blacklist']
-        title = "🚫 点击黑名单 ID 删除："
+        title = f"🚫 点击黑名单 ID {action_text}："
 
     total_pages = math.ceil(len(data_list) / items_per_page) or 1
     page = min(max(0, page), total_pages - 1)
@@ -91,14 +94,15 @@ def build_delete_list(config, list_type, page=0):
     buttons = []
     for i, item in enumerate(page_items):
         actual_idx = start_idx + i
-        display_text = f"❌ {str(item)[:30]}..." if len(str(item)) > 30 else f"❌ {item}"
-        buttons.append([Button.inline(display_text, f"del_{list_type}_{actual_idx}".encode())])
+        icon = '❌' if action == 'del' else '✏️'
+        display_text = f"{icon} {str(item)[:30]}..." if len(str(item)) > 30 else f"{icon} {item}"
+        buttons.append([Button.inline(display_text, f"{action}_{list_type}_{actual_idx}".encode())])
     
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(Button.inline("⬅️ 上一页", f"list_{list_type}_{page-1}".encode()))
+        nav_buttons.append(Button.inline("⬅️ 上一页", f"list_{list_type}_{action}_{page-1}".encode()))
     if page < total_pages - 1:
-        nav_buttons.append(Button.inline("下一页 ➡️", f"list_{list_type}_{page+1}".encode()))
+        nav_buttons.append(Button.inline("下一页 ➡️", f"list_{list_type}_{action}_{page+1}".encode()))
     if nav_buttons:
         buttons.append(nav_buttons)
         
@@ -115,11 +119,9 @@ async def bot_message_handler(event):
         await event.reply(text, buttons=buttons)
         return
 
-    # 快捷功能：抓取转发消息提取 ID
     if event.fwd_from:
         WAITING_STATE[ADMIN_ID] = None
         chat_id, user_id = None, None
-        
         if event.fwd_from.saved_from_peer:
             chat_id = utils.get_peer_id(event.fwd_from.saved_from_peer)
         if event.fwd_from.from_id:
@@ -157,11 +159,24 @@ async def bot_message_handler(event):
         elif state == 'add_key':
             if text not in config['keywords']: config['keywords'].append(text)
             
+        elif state.startswith('doedit_'):
+            parts = state.split('_')
+            list_type, idx = parts[1], int(parts[2])
+            target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
+            
+            if list_type in ['grp', 'blk']:
+                val = int(text)
+                target_list[idx] = val
+            else:
+                target_list[idx] = text
+            
         save_config(config)
         WAITING_STATE[ADMIN_ID] = None
         cfg = load_config()
         t, b = build_main_menu(cfg)
-        await event.reply(f"✅ 添加成功：{text}", buttons=b)
+        success_msg = "✅ 修改成功！" if state.startswith('doedit_') else f"✅ 添加成功：{text}"
+        await event.reply(success_msg, buttons=b)
+        
     except ValueError:
         await event.reply("❌ ID必须是数字，请重新输入或发 /cancel 取消。")
 
@@ -216,8 +231,8 @@ async def bot_callback(event):
 
     elif data.startswith('list_'):
         parts = data.split('_')
-        list_type, page = parts[1], int(parts[2])
-        t, b = build_delete_list(config, list_type, page)
+        list_type, action, page = parts[1], parts[2], int(parts[3])
+        t, b = build_item_list(config, list_type, action, page)
         await event.edit(t, buttons=b)
 
     elif data.startswith('del_'):
@@ -230,9 +245,18 @@ async def bot_callback(event):
             save_config(config)
             await event.answer(f"已删除: {deleted_item}")
         
-        t, b = build_delete_list(config, list_type, 0)
+        t, b = build_item_list(config, list_type, 'del', 0)
         await event.edit(t, buttons=b)
 
+    elif data.startswith('edit_'):
+        parts = data.split('_')
+        list_type, idx = parts[1], int(parts[2])
+        target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
+        
+        if 0 <= idx < len(target_list):
+            old_val = target_list[idx]
+            WAITING_STATE[ADMIN_ID] = f"doedit_{list_type}_{idx}"
+            await event.reply(f"👉 正在修改：\n`{old_val}`\n\n请直接发送修改后的新内容：\n_发送 /cancel 取消_")
 
 # ==========================================
 #         第二部分：Userbot 监听端逻辑
@@ -282,9 +306,9 @@ async def user_handler(event):
             elif hasattr(sender, 'title'): 
                 sender_name = sender.title
 
-        # --- 修复 None 问题的核心逻辑 ---
-        fwd_name = "无"
+        fwd_info = ""
         if event.fwd_from:
+            fwd_name = "未知"
             if event.fwd_from.from_name: 
                 fwd_name = event.fwd_from.from_name
             elif event.fwd_from.from_id:
@@ -298,6 +322,7 @@ async def user_handler(event):
                         fwd_name = f"{first} {last}".strip()
                 except: 
                     fwd_name = f"ID: {fwd_from_id}"
+            fwd_info = f"**直接来源:** {fwd_name}\n"
 
         source_name = getattr(chat, 'title', "Unknown Group")
         chat_id_str = str(chat_id)
@@ -307,7 +332,7 @@ async def user_handler(event):
             f"**📢 监控命中**\n"
             f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
             f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
-            f"**直接来源:** {fwd_name}\n"
+            f"{fwd_info}"
             f"**直达链接:** [点击跳转]({msg_link})\n"
             f"--- 👇 原消息如下 👇 ---"
         )
