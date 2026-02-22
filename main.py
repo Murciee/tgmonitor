@@ -136,7 +136,7 @@ async def bot_message_handler(event):
             await event.reply(text, buttons=buttons)
             return
 
-    # 处理手动输入
+    # 处理手动输入 (包含防重复逻辑)
     state = WAITING_STATE.get(ADMIN_ID)
     if not state: return
     if event.text.startswith('/'): return
@@ -151,15 +151,22 @@ async def bot_message_handler(event):
 
     config = load_config()
     try:
+        is_duplicate = False
+        
+        # 1. 添加逻辑的查重
         if state == 'add_grp':
             val = int(text)
-            if val not in config['groups']: config['groups'].append(val)
+            if val in config['groups']: is_duplicate = True
+            else: config['groups'].append(val)
         elif state == 'add_blk':
             val = int(text)
-            if val not in config['blacklist']: config['blacklist'].append(val)
+            if val in config['blacklist']: is_duplicate = True
+            else: config['blacklist'].append(val)
         elif state == 'add_key':
-            if text not in config['keywords']: config['keywords'].append(text)
+            if text in config['keywords']: is_duplicate = True
+            else: config['keywords'].append(text)
             
+        # 2. 修改逻辑的查重 (防止修改后和已有的撞车)
         elif state.startswith('doedit_'):
             parts = state.split('_')
             list_type, idx = parts[1], int(parts[2])
@@ -167,19 +174,28 @@ async def bot_message_handler(event):
             
             if list_type in ['grp', 'blk']:
                 val = int(text)
-                target_list[idx] = val
+                if val in target_list and target_list.index(val) != idx: is_duplicate = True
+                else: target_list[idx] = val
             else:
-                target_list[idx] = text
+                if text in target_list and target_list.index(text) != idx: is_duplicate = True
+                else: target_list[idx] = text
+
+        # 3. 拦截并发送警告
+        if is_duplicate:
+            WAITING_STATE[ADMIN_ID] = None
+            t, b = build_main_menu(config)
+            await event.reply(f"⚠️ 操作失败：`{text}` 已存在于列表中，请勿重复添加/修改！", buttons=b)
+            return
             
+        # 4. 正常保存并提示成功
         save_config(config)
         WAITING_STATE[ADMIN_ID] = None
-        cfg = load_config()
-        t, b = build_main_menu(cfg)
+        t, b = build_main_menu(config)
         success_msg = "✅ 修改成功！" if state.startswith('doedit_') else f"✅ 添加成功：{text}"
         await event.reply(success_msg, buttons=b)
         
     except ValueError:
-        await event.reply("❌ ID必须是数字，请重新输入或发 /cancel 取消。")
+        await event.reply("❌ 格式错误：ID必须是纯数字！请重新输入或发 /cancel 取消。")
 
 
 @bot_client.on(events.CallbackQuery())
@@ -225,10 +241,22 @@ async def bot_callback(event):
     elif data.startswith('quick_'):
         parts = data.split('_')
         action, val = parts[1], int(parts[2])
-        if action == 'grp' and val not in config['groups']: config['groups'].append(val)
-        if action == 'blk' and val not in config['blacklist']: config['blacklist'].append(val)
-        save_config(config)
-        await event.edit(f"✅ 已成功执行快捷操作！")
+        
+        if action == 'grp':
+            if val in config['groups']:
+                await event.edit(f"⚠️ 群组 `{val}` 已经在监控列表中了！")
+            else:
+                config['groups'].append(val)
+                save_config(config)
+                await event.edit(f"✅ 已成功将群组 `{val}` 加入监控！")
+                
+        elif action == 'blk':
+            if val in config['blacklist']:
+                await event.edit(f"⚠️ 用户 `{val}` 已经在黑名单中了！")
+            else:
+                config['blacklist'].append(val)
+                save_config(config)
+                await event.edit(f"✅ 已成功将用户 `{val}` 加入黑名单！")
 
     elif data.startswith('list_'):
         parts = data.split('_')
@@ -330,21 +358,14 @@ async def user_handler(event):
         msg_link = f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None) else f"https://t.me/c/{chat_id_str.replace('-100', '')}/{event.id}"
         
         # --- 智能分流核心逻辑 ---
-        
-        # 1. 检查是否有内联按钮
         has_buttons = event.message.reply_markup is not None
-        
-        # 2. 检查是否有真实的媒体文件 (图片/视频/文档等)
         has_real_media = False
         if event.message.media:
-            # 排除掉因为纯文本里带了网址而自动生成的“网页预览(WebPage)”
             if event.message.media.__class__.__name__ != 'MessageMediaWebPage':
                 has_real_media = True
 
-        # 只要有按钮或者真实的图片媒体，就采用原生转发以保留特征
         needs_native_forward = has_buttons or has_real_media
 
-        # 构建基础报告头
         log_header = (
             f"**📢 监控命中**\n"
             f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
@@ -356,12 +377,10 @@ async def user_handler(event):
         
         try:
             if needs_native_forward:
-                # 【模式A：拆分发送】为了保留按钮和图片，先发报告头，再原生转发
                 await user_client.send_message(TARGET_CHANNEL, log_header, link_preview=False)
                 await event.forward_to(TARGET_CHANNEL)
                 logging.info(f"分流发送 (带按钮/媒体): {source_name}")
             else:
-                # 【模式B：合并发送】纯文本，直接把内容拼在下面，1次请求极限触达
                 final_text = f"{log_header}\n\n{text}"
                 await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
                 logging.info(f"极速合并发送 (纯文本): {source_name}")
