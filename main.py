@@ -24,13 +24,17 @@ def load_config():
             "status": "running",
             "groups": [],
             "keywords": [r"(?i)emby.*(注册|邀请|开注)"],
-            "blacklist": []
+            "blacklist": [],
+            "group_names": {}, # 用于存储群组名称字典
+            "user_names": {}   # 用于存储黑名单名称字典
         }
         save_config(default_config)
         return default_config
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         config = json.load(f)
         if "status" not in config: config["status"] = "running"
+        if "group_names" not in config: config["group_names"] = {}
+        if "user_names" not in config: config["user_names"] = {}
         return config
 
 def save_config(config):
@@ -71,17 +75,17 @@ def build_sub_menu(menu_type):
 
 def build_item_list(config, list_type, action, page=0):
     items_per_page = 8
-    
     action_text = "删除" if action == 'del' else "修改"
+    
     if list_type == 'grp':
         data_list = config['groups']
-        title = f"📁 点击群组 ID {action_text}："
+        title = f"📁 点击群组 {action_text}："
     elif list_type == 'key':
         data_list = config['keywords']
         title = f"🏷️ 点击关键词/正则 {action_text}："
     else:
         data_list = config['blacklist']
-        title = f"🚫 点击黑名单 ID {action_text}："
+        title = f"🚫 点击黑名单 {action_text}："
 
     total_pages = math.ceil(len(data_list) / items_per_page) or 1
     page = min(max(0, page), total_pages - 1)
@@ -94,7 +98,18 @@ def build_item_list(config, list_type, action, page=0):
     for i, item in enumerate(page_items):
         actual_idx = start_idx + i
         icon = '❌' if action == 'del' else '✏️'
-        display_text = f"{icon} {str(item)[:30]}..." if len(str(item)) > 30 else f"{icon} {item}"
+        
+        # 智能匹配名字显示
+        if list_type == 'grp':
+            name = config.get('group_names', {}).get(str(item), "未命名群组")
+            raw_text = f"{name} ({item})"
+        elif list_type == 'blk':
+            name = config.get('user_names', {}).get(str(item), "未知用户")
+            raw_text = f"{name} ({item})"
+        else:
+            raw_text = str(item)
+            
+        display_text = f"{icon} {raw_text[:35]}..." if len(raw_text) > 35 else f"{icon} {raw_text}"
         buttons.append([Button.inline(display_text, f"{action}_{list_type}_{actual_idx}".encode())])
     
     nav_buttons = []
@@ -136,7 +151,7 @@ async def bot_message_handler(event):
             await event.reply(text, buttons=buttons)
             return
 
-    # 处理手动输入 (包含防重复逻辑)
+    # 处理手动输入 (包含防重复与提取备注逻辑)
     state = WAITING_STATE.get(ADMIN_ID)
     if not state: return
     if event.text.startswith('/'): return
@@ -153,29 +168,41 @@ async def bot_message_handler(event):
     try:
         is_duplicate = False
         
-        # 1. 添加逻辑的查重
+        # 提取用户可能输入的备注 (按空格分割)
+        parts = text.split(maxsplit=1)
+        val_str = parts[0]
+        remark = parts[1] if len(parts) > 1 else None
+        
+        # 1. 添加逻辑的查重与备注保存
         if state == 'add_grp':
-            val = int(text)
+            val = int(val_str)
             if val in config['groups']: is_duplicate = True
-            else: config['groups'].append(val)
+            else: 
+                config['groups'].append(val)
+                config.setdefault('group_names', {})[str(val)] = remark or "未命名群组"
         elif state == 'add_blk':
-            val = int(text)
+            val = int(val_str)
             if val in config['blacklist']: is_duplicate = True
-            else: config['blacklist'].append(val)
+            else: 
+                config['blacklist'].append(val)
+                config.setdefault('user_names', {})[str(val)] = remark or "未知用户"
         elif state == 'add_key':
             if text in config['keywords']: is_duplicate = True
             else: config['keywords'].append(text)
             
-        # 2. 修改逻辑的查重 (防止修改后和已有的撞车)
+        # 2. 修改逻辑的查重与备注保存
         elif state.startswith('doedit_'):
-            parts = state.split('_')
-            list_type, idx = parts[1], int(parts[2])
+            state_parts = state.split('_')
+            list_type, idx = state_parts[1], int(state_parts[2])
             target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
             
             if list_type in ['grp', 'blk']:
-                val = int(text)
+                val = int(val_str)
                 if val in target_list and target_list.index(val) != idx: is_duplicate = True
-                else: target_list[idx] = val
+                else: 
+                    target_list[idx] = val
+                    if list_type == 'grp' and remark: config.setdefault('group_names', {})[str(val)] = remark
+                    if list_type == 'blk' and remark: config.setdefault('user_names', {})[str(val)] = remark
             else:
                 if text in target_list and target_list.index(text) != idx: is_duplicate = True
                 else: target_list[idx] = text
@@ -184,7 +211,7 @@ async def bot_message_handler(event):
         if is_duplicate:
             WAITING_STATE[ADMIN_ID] = None
             t, b = build_main_menu(config)
-            await event.reply(f"⚠️ 操作失败：`{text}` 已存在于列表中，请勿重复添加/修改！", buttons=b)
+            await event.reply(f"⚠️ 操作失败：`{val_str}` 已存在于列表中，请勿重复添加/修改！", buttons=b)
             return
             
         # 4. 正常保存并提示成功
@@ -222,12 +249,15 @@ async def bot_callback(event):
         await event.edit(t, buttons=b)
         
     elif data == 'view_all':
+        grp_str = ", ".join([f"{config.get('group_names', {}).get(str(x), '未命名')}({x})" for x in config['groups']])
+        blk_str = ", ".join([f"{config.get('user_names', {}).get(str(x), '未知')}({x})" for x in config['blacklist']])
+        
         text = (
             f"📊 **完整配置概览**\n\n"
             f"**状态:** {config['status']}\n"
-            f"**群组:** `{config['groups']}`\n"
+            f"**群组:** `{grp_str}`\n"
             f"**正则:** `{config['keywords']}`\n"
-            f"**黑名单:** `{config['blacklist']}`"
+            f"**黑名单:** `{blk_str}`"
         )
         await event.answer("已在聊天中输出全部配置")
         await event.reply(text)
@@ -235,171 +265,7 @@ async def bot_callback(event):
     elif data.startswith('prompt_add_'):
         m_type = data.split('_')[2]
         WAITING_STATE[ADMIN_ID] = f'add_{m_type}'
-        tips = {'grp': '群组ID', 'key': '关键词/正则', 'blk': '用户ID'}
-        await event.reply(f"👉 请发送要添加的 **{tips[m_type]}**\n_发送 /cancel 取消_")
-
-    elif data.startswith('quick_'):
-        parts = data.split('_')
-        action, val = parts[1], int(parts[2])
-        
-        if action == 'grp':
-            if val in config['groups']:
-                await event.edit(f"⚠️ 群组 `{val}` 已经在监控列表中了！")
-            else:
-                config['groups'].append(val)
-                save_config(config)
-                await event.edit(f"✅ 已成功将群组 `{val}` 加入监控！")
-                
-        elif action == 'blk':
-            if val in config['blacklist']:
-                await event.edit(f"⚠️ 用户 `{val}` 已经在黑名单中了！")
-            else:
-                config['blacklist'].append(val)
-                save_config(config)
-                await event.edit(f"✅ 已成功将用户 `{val}` 加入黑名单！")
-
-    elif data.startswith('list_'):
-        parts = data.split('_')
-        list_type, action, page = parts[1], parts[2], int(parts[3])
-        t, b = build_item_list(config, list_type, action, page)
-        await event.edit(t, buttons=b)
-
-    elif data.startswith('del_'):
-        parts = data.split('_')
-        list_type, idx = parts[1], int(parts[2])
-        target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
-        
-        if 0 <= idx < len(target_list):
-            deleted_item = target_list.pop(idx)
-            save_config(config)
-            await event.answer(f"已删除: {deleted_item}")
-        
-        t, b = build_item_list(config, list_type, 'del', 0)
-        await event.edit(t, buttons=b)
-
-    elif data.startswith('edit_'):
-        parts = data.split('_')
-        list_type, idx = parts[1], int(parts[2])
-        target_list = config['groups'] if list_type == 'grp' else (config['keywords'] if list_type == 'key' else config['blacklist'])
-        
-        if 0 <= idx < len(target_list):
-            old_val = target_list[idx]
-            WAITING_STATE[ADMIN_ID] = f"doedit_{list_type}_{idx}"
-            await event.reply(f"👉 正在修改：\n`{old_val}`\n\n请直接发送修改后的新内容：\n_发送 /cancel 取消_")
-
-# ==========================================
-#         第二部分：Userbot 监听端逻辑
-# ==========================================
-
-@user_client.on(events.NewMessage)
-async def user_handler(event):
-    config = load_config()
-    
-    if config.get('status', 'running') != 'running': return
-    
-    chat_id = event.chat_id
-    if chat_id not in config['groups']: return
-
-    sender_id = event.sender_id
-    fwd_from_id = None
-    if event.fwd_from:
-        if event.fwd_from.from_id:
-            if hasattr(event.fwd_from.from_id, 'user_id'): fwd_from_id = event.fwd_from.from_id.user_id
-            elif hasattr(event.fwd_from.from_id, 'channel_id'): fwd_from_id = event.fwd_from.from_id.channel_id
-
-    blacklist_strs = [str(x).replace('-100', '') for x in config['blacklist']]
-    def is_blocked(uid): return str(uid).replace('-100', '') in blacklist_strs if uid else False
-
-    if is_blocked(sender_id) or is_blocked(fwd_from_id): return
-
-    text = event.message.text or ""
-    matched = False
-    for regex in config['keywords']:
-        try:
-            if re.search(regex, text):
-                matched = True
-                break
-        except Exception as e:
-            logging.error(f"正则错误 {regex}: {e}")
-            
-    if matched:
-        chat = await event.get_chat()
-        sender = await event.get_sender()
-        
-        sender_name = "Unknown"
-        if sender:
-            if hasattr(sender, 'first_name'): 
-                first = getattr(sender, 'first_name', None) or ''
-                last = getattr(sender, 'last_name', None) or ''
-                sender_name = f"{first} {last}".strip()
-            elif hasattr(sender, 'title'): 
-                sender_name = sender.title
-
-        fwd_info = ""
-        if event.fwd_from:
-            fwd_name = "未知"
-            if event.fwd_from.from_name: 
-                fwd_name = event.fwd_from.from_name
-            elif event.fwd_from.from_id:
-                try:
-                    fwd_entity = await user_client.get_entity(event.fwd_from.from_id)
-                    if hasattr(fwd_entity, 'title') and fwd_entity.title:
-                        fwd_name = fwd_entity.title
-                    else:
-                        first = getattr(fwd_entity, 'first_name', None) or ''
-                        last = getattr(fwd_entity, 'last_name', None) or ''
-                        fwd_name = f"{first} {last}".strip()
-                except: 
-                    fwd_name = f"ID: {fwd_from_id}"
-            fwd_info = f"**直接来源:** {fwd_name}\n"
-
-        source_name = getattr(chat, 'title', "Unknown Group")
-        chat_id_str = str(chat_id)
-        msg_link = f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None) else f"https://t.me/c/{chat_id_str.replace('-100', '')}/{event.id}"
-        
-        # --- 智能分流核心逻辑 ---
-        has_buttons = event.message.reply_markup is not None
-        has_real_media = False
-        if event.message.media:
-            if event.message.media.__class__.__name__ != 'MessageMediaWebPage':
-                has_real_media = True
-
-        needs_native_forward = has_buttons or has_real_media
-
-        # 构建统一的来源信息块
-        source_info = (
-            f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
-            f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
-            f"{fwd_info}"
-            f"**直达链接:** [点击跳转]({msg_link})"
-        )
-        
-        try:
-            if needs_native_forward:
-                # 模式A：拆分发送。先发来源头，再发原生内容，确保外面预览到的是内容。
-                log_header = f"🎯 **来源信息**\n{source_info}"
-                await user_client.send_message(TARGET_CHANNEL, log_header, link_preview=False)
-                await event.forward_to(TARGET_CHANNEL)
-                logging.info(f"分流发送 (带按钮/媒体): {source_name}")
-            else:
-                # 模式B：合并发送。正文放顶端，下面加分隔线和来源信息。
-                final_text = f"{text}\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n{source_info}"
-                await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
-                logging.info(f"极速合并发送 (纯文本): {source_name}")
-                
-        except Exception as e:
-            logging.error(f"发送失败: {e}")
-
-# --- 启动逻辑 ---
-async def main():
-    print("正在连接交互 Bot...")
-    await bot_client.start(bot_token=BOT_TOKEN)
-    print("✅ 交互 Bot 启动成功！\n🎉 系统运行中... 请前往你的 Bot 发送 /start 开始管理。")
-    await asyncio.gather(user_client.run_until_disconnected(), bot_client.run_until_disconnected())
-
-if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    print("--- 检查 Userbot 凭证 ---")
-    user_client.start()
-    print("✅ Userbot 检查通过！\n")
-    loop.run_until_complete(main())
+        tips = {
+            'grp': '群组ID (支持直接打备注，例如: `-100123 测试群`)', 
+            'key': '关键词/正则', 
+            'blk':
