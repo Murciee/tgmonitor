@@ -5,7 +5,6 @@ import logging
 import asyncio
 import math
 from telethon import TelegramClient, events, Button, utils
-from telethon.tl.types import User
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
 
@@ -119,6 +118,7 @@ async def bot_message_handler(event):
         await event.reply(text, buttons=buttons)
         return
 
+    # 快捷提取 ID
     if event.fwd_from:
         WAITING_STATE[ADMIN_ID] = None
         chat_id, user_id = None, None
@@ -136,6 +136,7 @@ async def bot_message_handler(event):
             await event.reply(text, buttons=buttons)
             return
 
+    # 处理手动输入
     state = WAITING_STATE.get(ADMIN_ID)
     if not state: return
     if event.text.startswith('/'): return
@@ -328,7 +329,23 @@ async def user_handler(event):
         chat_id_str = str(chat_id)
         msg_link = f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None) else f"https://t.me/c/{chat_id_str.replace('-100', '')}/{event.id}"
         
-        log_text = (
+        # --- 智能分流核心逻辑 ---
+        
+        # 1. 检查是否有内联按钮
+        has_buttons = event.message.reply_markup is not None
+        
+        # 2. 检查是否有真实的媒体文件 (图片/视频/文档等)
+        has_real_media = False
+        if event.message.media:
+            # 排除掉因为纯文本里带了网址而自动生成的“网页预览(WebPage)”
+            if event.message.media.__class__.__name__ != 'MessageMediaWebPage':
+                has_real_media = True
+
+        # 只要有按钮或者真实的图片媒体，就采用原生转发以保留特征
+        needs_native_forward = has_buttons or has_real_media
+
+        # 构建基础报告头
+        log_header = (
             f"**📢 监控命中**\n"
             f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
             f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
@@ -338,11 +355,19 @@ async def user_handler(event):
         )
         
         try:
-            await user_client.send_message(TARGET_CHANNEL, log_text, link_preview=False)
-            await event.forward_to(TARGET_CHANNEL)
-            logging.info(f"转发成功: {source_name}")
+            if needs_native_forward:
+                # 【模式A：拆分发送】为了保留按钮和图片，先发报告头，再原生转发
+                await user_client.send_message(TARGET_CHANNEL, log_header, link_preview=False)
+                await event.forward_to(TARGET_CHANNEL)
+                logging.info(f"分流发送 (带按钮/媒体): {source_name}")
+            else:
+                # 【模式B：合并发送】纯文本，直接把内容拼在下面，1次请求极限触达
+                final_text = f"{log_header}\n\n{text}"
+                await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
+                logging.info(f"极速合并发送 (纯文本): {source_name}")
+                
         except Exception as e:
-            logging.error(f"转发失败: {e}")
+            logging.error(f"发送失败: {e}")
 
 # --- 启动逻辑 ---
 async def main():
