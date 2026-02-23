@@ -17,29 +17,56 @@ ADMIN_ID = int(os.environ.get('ADMIN_ID'))
 
 CONFIG_FILE = 'config.json'
 
-# --- 配置文件管理 ---
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        default_config = {
-            "status": "running",
-            "groups": [],
-            "keywords": [r"(?i)emby.*(注册|邀请|开注)"],
-            "blacklist": [],
-            "group_names": {}, # 用于存储群组名称字典
-            "user_names": {}   # 用于存储黑名单名称字典
-        }
-        save_config(default_config)
-        return default_config
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-        if "status" not in config: config["status"] = "running"
-        if "group_names" not in config: config["group_names"] = {}
-        if "user_names" not in config: config["user_names"] = {}
-        return config
+# --- 🚀 高性能内存缓存与异步锁 ---
+GLOBAL_CONFIG = {}
+COMPILED_REGEXES = []
+CONFIG_LOCK = asyncio.Lock()
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
+async def load_config_async():
+    global GLOBAL_CONFIG, COMPILED_REGEXES
+    async with CONFIG_LOCK:
+        if not os.path.exists(CONFIG_FILE):
+            GLOBAL_CONFIG = {
+                "status": "running",
+                "notify_dm": True,  # 新增：默认开启私聊通知
+                "groups": [],
+                "keywords": [r"(?i)emby.*(注册|邀请|开注)"],
+                "blacklist": [],
+                "group_names": {},
+                "user_names": {}
+            }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(GLOBAL_CONFIG, f, ensure_ascii=False, indent=4)
+        else:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                GLOBAL_CONFIG = json.load(f)
+                # 兼容老数据结构
+                if "status" not in GLOBAL_CONFIG: GLOBAL_CONFIG["status"] = "running"
+                if "notify_dm" not in GLOBAL_CONFIG: GLOBAL_CONFIG["notify_dm"] = True
+                if "group_names" not in GLOBAL_CONFIG: GLOBAL_CONFIG["group_names"] = {}
+                if "user_names" not in GLOBAL_CONFIG: GLOBAL_CONFIG["user_names"] = {}
+
+        # 启动时预编译所有正则，榨干 CPU 性能
+        COMPILED_REGEXES.clear()
+        for kw in GLOBAL_CONFIG.get("keywords", []):
+            try:
+                COMPILED_REGEXES.append(re.compile(kw))
+            except Exception as e:
+                logging.error(f"正则预编译异常 {kw}: {e}")
+
+async def save_config_async():
+    global COMPILED_REGEXES
+    async with CONFIG_LOCK:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(GLOBAL_CONFIG, f, ensure_ascii=False, indent=4)
+            
+        # 配置文件保存后，重新编译正则对象
+        COMPILED_REGEXES.clear()
+        for kw in GLOBAL_CONFIG.get("keywords", []):
+            try:
+                COMPILED_REGEXES.append(re.compile(kw))
+            except Exception as e:
+                logging.error(f"正则重新编译异常 {kw}: {e}")
 
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
@@ -52,9 +79,12 @@ WAITING_STATE = {}
 
 def build_main_menu(config):
     status_icon = "🟢 运行中" if config['status'] == 'running' else "🔴 已暂停"
-    text = f"⚙️ **Emby 监控管理控制台**\n\n当前状态: **{status_icon}**\n请选择要管理的模块："
+    notify_icon = "🔔 开启" if config.get('notify_dm', True) else "🔕 关闭"
+    
+    text = f"⚙️ **Emby 监控管理控制台**\n\n系统状态: **{status_icon}**\n私聊提醒: **{notify_icon}**\n请选择要管理的模块："
     buttons = [
-        [Button.inline(f"切换状态：{status_icon}", b"toggle_status")],
+        [Button.inline(f"监控状态: {status_icon}", b"toggle_status"),
+         Button.inline(f"私聊提醒: {notify_icon}", b"toggle_notify")],
         [Button.inline(f"📁 群组管理 ({len(config['groups'])})", b"menu_grp"),
          Button.inline(f"🏷️ 关键词管理 ({len(config['keywords'])})", b"menu_key")],
         [Button.inline(f"🚫 黑名单管理 ({len(config['blacklist'])})", b"menu_blk"),
@@ -99,7 +129,6 @@ def build_item_list(config, list_type, action, page=0):
         actual_idx = start_idx + i
         icon = '❌' if action == 'del' else '✏️'
         
-        # 智能匹配名字显示
         if list_type == 'grp':
             name = config.get('group_names', {}).get(str(item), "未命名群组")
             raw_text = f"{name} ({item})"
@@ -128,12 +157,10 @@ def build_item_list(config, list_type, action, page=0):
 async def bot_message_handler(event):
     if event.text.startswith('/start'):
         WAITING_STATE[ADMIN_ID] = None
-        config = load_config()
-        text, buttons = build_main_menu(config)
+        text, buttons = build_main_menu(GLOBAL_CONFIG)
         await event.reply(text, buttons=buttons)
         return
 
-    # 快捷提取 ID
     if event.fwd_from:
         WAITING_STATE[ADMIN_ID] = None
         chat_id, user_id = None, None
@@ -151,7 +178,6 @@ async def bot_message_handler(event):
             await event.reply(text, buttons=buttons)
             return
 
-    # 处理手动输入 (包含防重复与提取备注逻辑)
     state = WAITING_STATE.get(ADMIN_ID)
     if not state: return
     if event.text.startswith('/'): return
@@ -159,21 +185,17 @@ async def bot_message_handler(event):
     text = event.text.strip()
     if text.lower() == '/cancel':
         WAITING_STATE[ADMIN_ID] = None
-        cfg = load_config()
-        t, b = build_main_menu(cfg)
+        t, b = build_main_menu(GLOBAL_CONFIG)
         await event.reply("✅ 操作已取消。", buttons=b)
         return
 
-    config = load_config()
+    config = GLOBAL_CONFIG
     try:
         is_duplicate = False
-        
-        # 提取用户可能输入的备注 (按空格分割)
         parts = text.split(maxsplit=1)
         val_str = parts[0]
         remark = parts[1] if len(parts) > 1 else None
         
-        # 1. 添加逻辑的查重与备注保存
         if state == 'add_grp':
             val = int(val_str)
             if val in config['groups']: is_duplicate = True
@@ -190,7 +212,6 @@ async def bot_message_handler(event):
             if text in config['keywords']: is_duplicate = True
             else: config['keywords'].append(text)
             
-        # 2. 修改逻辑的查重与备注保存
         elif state.startswith('doedit_'):
             state_parts = state.split('_')
             list_type, idx = state_parts[1], int(state_parts[2])
@@ -207,15 +228,13 @@ async def bot_message_handler(event):
                 if text in target_list and target_list.index(text) != idx: is_duplicate = True
                 else: target_list[idx] = text
 
-        # 3. 拦截并发送警告
         if is_duplicate:
             WAITING_STATE[ADMIN_ID] = None
             t, b = build_main_menu(config)
             await event.reply(f"⚠️ 操作失败：`{val_str}` 已存在于列表中，请勿重复添加/修改！", buttons=b)
             return
             
-        # 4. 正常保存并提示成功
-        save_config(config)
+        await save_config_async()
         WAITING_STATE[ADMIN_ID] = None
         t, b = build_main_menu(config)
         success_msg = "✅ 修改成功！" if state.startswith('doedit_') else f"✅ 添加成功：{text}"
@@ -232,7 +251,7 @@ async def bot_callback(event):
         return
 
     data = event.data.decode('utf-8')
-    config = load_config()
+    config = GLOBAL_CONFIG
     WAITING_STATE[ADMIN_ID] = None
 
     if data == 'menu_main':
@@ -244,7 +263,13 @@ async def bot_callback(event):
     
     elif data == 'toggle_status':
         config['status'] = 'paused' if config['status'] == 'running' else 'running'
-        save_config(config)
+        await save_config_async()
+        t, b = build_main_menu(config)
+        await event.edit(t, buttons=b)
+
+    elif data == 'toggle_notify':
+        config['notify_dm'] = not config.get('notify_dm', True)
+        await save_config_async()
         t, b = build_main_menu(config)
         await event.edit(t, buttons=b)
         
@@ -254,7 +279,7 @@ async def bot_callback(event):
         
         text = (
             f"📊 **完整配置概览**\n\n"
-            f"**状态:** {config['status']}\n"
+            f"**状态:** {config['status']} (私聊提醒: {'开启' if config.get('notify_dm', True) else '关闭'})\n"
             f"**群组:** `{grp_str}`\n"
             f"**正则:** `{config['keywords']}`\n"
             f"**黑名单:** `{blk_str}`"
@@ -282,7 +307,7 @@ async def bot_callback(event):
             else:
                 config['groups'].append(val)
                 config.setdefault('group_names', {})[str(val)] = "未命名群组"
-                save_config(config)
+                await save_config_async()
                 await event.edit(f"✅ 已成功将群组 `{val}` 加入监控！")
                 
         elif action == 'blk':
@@ -291,7 +316,7 @@ async def bot_callback(event):
             else:
                 config['blacklist'].append(val)
                 config.setdefault('user_names', {})[str(val)] = "未知用户"
-                save_config(config)
+                await save_config_async()
                 await event.edit(f"✅ 已成功将用户 `{val}` 加入黑名单！")
 
     elif data.startswith('list_'):
@@ -307,12 +332,11 @@ async def bot_callback(event):
         
         if 0 <= idx < len(target_list):
             deleted_item = target_list.pop(idx)
-            # 清理废弃的名称字典数据以防臃肿
             if list_type == 'grp' and str(deleted_item) in config.get('group_names', {}):
                 del config['group_names'][str(deleted_item)]
             if list_type == 'blk' and str(deleted_item) in config.get('user_names', {}):
                 del config['user_names'][str(deleted_item)]
-            save_config(config)
+            await save_config_async()
             await event.answer(f"已删除: {deleted_item}")
         
         t, b = build_item_list(config, list_type, 'del', 0)
@@ -334,7 +358,8 @@ async def bot_callback(event):
 
 @user_client.on(events.NewMessage)
 async def user_handler(event):
-    config = load_config()
+    # 极速内存读取，0磁盘消耗
+    config = GLOBAL_CONFIG
     
     if config.get('status', 'running') != 'running': return
     
@@ -355,13 +380,12 @@ async def user_handler(event):
 
     text = event.message.text or ""
     matched = False
-    for regex in config['keywords']:
-        try:
-            if re.search(regex, text):
-                matched = True
-                break
-        except Exception as e:
-            logging.error(f"正则错误 {regex}: {e}")
+    
+    # 极速匹配：使用预编译的正则引擎
+    for regex in COMPILED_REGEXES:
+        if regex.search(text):
+            matched = True
+            break
             
     if matched:
         chat = await event.get_chat()
@@ -390,14 +414,14 @@ async def user_handler(event):
                         first = getattr(fwd_entity, 'first_name', None) or ''
                         last = getattr(fwd_entity, 'last_name', None) or ''
                         fwd_name = f"{first} {last}".strip()
-                except: 
+                except Exception as e: 
                     fwd_name = f"ID: {fwd_from_id}"
             fwd_info = f"**直接来源:** {fwd_name}\n"
 
         source_name = getattr(chat, 'title', "Unknown Group")
         chat_id_str = str(chat_id)
         
-        # --- 自动学习/更新群组和用户名称黑科技 ---
+        # 智能自学习机制
         needs_save = False
         if config.get('group_names', {}).get(chat_id_str) != source_name:
             config.setdefault('group_names', {})[chat_id_str] = source_name
@@ -409,11 +433,10 @@ async def user_handler(event):
                 config.setdefault('user_names', {})[sender_id_str] = sender_name
                 needs_save = True
                 
-        if needs_save: save_config(config)
+        if needs_save: await save_config_async()
 
         msg_link = f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None) else f"https://t.me/c/{chat_id_str.replace('-100', '')}/{event.id}"
         
-        # --- 智能分流核心逻辑 ---
         has_buttons = event.message.reply_markup is not None
         has_real_media = False
         if event.message.media:
@@ -422,7 +445,6 @@ async def user_handler(event):
 
         needs_native_forward = has_buttons or has_real_media
 
-        # 构建统一的来源信息块
         source_info = (
             f"**来源群组:** {source_name} (`{chat_id_str}`)\n"
             f"**发送用户:** {sender_name} (`{sender_id or 'N/A'}`)\n"
@@ -434,18 +456,33 @@ async def user_handler(event):
             if needs_native_forward:
                 log_header = f"🎯 **来源信息**\n{source_info}"
                 await user_client.send_message(TARGET_CHANNEL, log_header, link_preview=False)
-                await event.forward_to(TARGET_CHANNEL)
+                fwd_msg = await event.forward_to(TARGET_CHANNEL)
                 logging.info(f"分流发送 (带按钮/媒体): {source_name}")
             else:
                 final_text = f"{text}\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n{source_info}"
-                await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
+                fwd_msg = await user_client.send_message(TARGET_CHANNEL, final_text, link_preview=False)
                 logging.info(f"极速合并发送 (纯文本): {source_name}")
                 
+            # --- 受控的私聊推送引擎 ---
+            if config.get('notify_dm', True):
+                channel_link = str(TARGET_CHANNEL).replace('-100', '')
+                jump_url = f"https://t.me/c/{channel_link}/{fwd_msg.id}"
+                
+                await bot_client.send_message(
+                    ADMIN_ID, 
+                    f"🛎 **监控触发！** 抓到来自 `{source_name}` 的新消息。\n[👉 点击前往频道查看]({jump_url})", 
+                    link_preview=False
+                )
+            
         except Exception as e:
-            logging.error(f"发送失败: {e}")
+            logging.error(f"发送或推送失败: {e}")
 
 # --- 启动逻辑 ---
 async def main():
+    print("--- 正在初始化全局内存与配置 ---")
+    await load_config_async()
+    print("✅ 预加载完成！")
+    
     print("正在连接交互 Bot...")
     await bot_client.start(bot_token=BOT_TOKEN)
     print("✅ 交互 Bot 启动成功！\n🎉 系统运行中... 请前往你的 Bot 发送 /start 开始管理。")
